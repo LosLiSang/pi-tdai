@@ -1,0 +1,26 @@
+{
+  "endpoint": "http://127.0.0.1:8420",
+  "apiKey": "",
+  "serviceId": "default",
+  "teamId": "team-xxx",
+  "agentId": "agt-xxx",
+  "userId": "usr-xxx",
+  "taskId": "",
+  "sessionPrefix": "pi",
+  "timeoutMs": 10000,
+  "tls": {
+    "rejectUnauthorized": true
+  },
+  "recall": {
+    "enabled": true,
+    "maxResults": 5,
+    "includePersona": true,
+    "includeScenarios": true,
+    "maxScenarios": 20,
+    "maxContextChars": 12000
+  },
+  "capture": {
+    "enabled": true,
+    "stripAssistantCodeBlocks": true
+  }
+}
