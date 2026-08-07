@@ -33,38 +33,71 @@
 
 ### 从当前目录开发/试用
 
+只对当前这次 pi 运行启用，不写入任何设置：
+
 ```bash
 npm install
 pi -e ./src/index.ts
 ```
 
-或者把整个目录作为本地 pi package 安装：
+### 仅安装到当前项目（推荐）
+
+使用 `-l` 写入当前项目的 `.pi/settings.json`，不要省略 `-l`：
 
 ```bash
 npm install
-pi install /absolute/path/to/pi-tencentdb-agent-memory
+pi install -l .
 ```
+
+也可以指定绝对路径：
+
+```bash
+pi install -l C:/Users/<user>/Documents/code/pi-tdai
+```
+
+检查安装范围：
+
+```bash
+pi list
+```
+
+输出中的 `Project packages` 部分就是当前项目安装的包；`User packages` 则是全局用户包。
+
+移除当前项目安装：
+
+```bash
+pi remove -l .
+```
+
+> `pi install .`（不带 `-l`）会写入用户级 `~/.pi/agent/settings.json`，属于全局安装，会在所有 pi 项目中加载本插件。若只想在当前项目加载，请使用 `-l`。
 
 ### 从 Git 仓库安装
 
-仓库发布后可使用：
+仓库发布后，仍需使用 `-l` 才会只安装到当前项目：
 
 ```bash
-pi install git:github.com/<owner>/pi-tencentdb-agent-memory
+pi install -l git:github.com/<owner>/pi-tencentdb-agent-memory
 ```
 
 pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 ## 配置
 
+插件同时读取全局与项目两份配置，项目配置覆盖全局：
+
+- 全局（适用于所有 pi 项目）：`~/.pi/agent/tencentdb-agent-memory.json`
+- 项目（仅当前项目，覆盖全局）：`<项目>/.pi/tencentdb-agent-memory.json`（只有项目被信任时读取）
+
 配置优先级从低到高：
 
 1. 内置默认值
-2. 全局配置：`~/.pi/agent/tencentdb-agent-memory.json`
-3. 项目配置：`<项目>/.pi/tencentdb-agent-memory.json`（只有项目被信任时读取）
-4. 环境变量
+2. 全局配置：`~/.pi/agent/tencentdb-agent-memory.json`（用户拥有，与项目信任无关，始终读取）
+3. 项目配置：`<项目>/.pi/tencentdb-agent-memory.json`（只有项目被信任时读取，覆盖同名全局字段）
+4. 环境变量（仅当存在全局或项目配置文件时作为覆盖）
 
-可复制 [`config.example.json`](./config.example.json)：
+没有全局且没有项目配置文件时，即使设置了环境变量，也不会启用 TDAI Memory。
+
+可复制 [`config.example.json`](./config.example.json) 到上述任一位置：
 
 ```json
 {
@@ -120,7 +153,7 @@ pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 布尔变量支持 `1/0`、`true/false`、`yes/no`、`on/off`。
 
-> 不建议把真实 API key 提交到项目仓库。优先使用环境变量，或者只写入全局配置文件。
+> 不建议把真实 API key 提交到项目仓库。可以把非敏感配置放在全局 `~/.pi/agent/tencentdb-agent-memory.json` 或项目 `.pi/tencentdb-agent-memory.json`，再用环境变量覆盖 API key；环境变量本身不能脱离配置文件启用插件。
 
 ## pi 命令
 
@@ -130,7 +163,28 @@ pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 ### `/tdai-memory-reload`
 
-重新读取全局配置、可信项目配置和环境变量，不需要重启 pi。
+重新读取全局与项目配置和环境变量，不需要重启 pi。
+
+### `/tdai-memory-config`
+
+交互式配置向导（TUI）。直接运行 `/tdai-memory-config`，逐字段填入，回车保留当前值、Esc 跳过该字段。填完确认后写入并自动重新加载。
+
+```
+/tdai-memory-config
+```
+
+向导行为：
+
+- **预填当前生效值**：打开即展示 pi 实际读取的配置（global 为底 + project 覆盖），所见即现状。
+- **写入目标可选**：向导第一步让你选择写到哪里——`自动`（项目已有 `.pi/tencentdb-agent-memory.json` 则写项目，否则写全局 `~/.pi/agent/`）、`项目配置`（当前项目 `.pi/`）或 `全局配置`（`~/.pi/agent/`）。选“自动”或按 Esc 时按默认规则。
+- **增量保存**：只写你改动过的字段，保留目标文件其它字段，不会把别处继承的值写死。
+- **核心字段**：`endpoint`、`teamId`、`agentId`、`userId`（后三者必填，空值会被拦下）。
+- **高级字段**：向导会问是否调整 `recall` / `capture` / `tls`；选“是”后逐项调整（布尔用选择器，数值用输入）。
+- **确认**：保存前会显示写入路径与字段清单，确认后才落盘；选否则不写。
+- **非交互模式**：`pi -p` / 脚本中运行会提示“请在交互式 pi 中运行”并退出（不写入）。
+
+> 需要脚本化/自动化写入时，请直接编辑对应 JSON 文件，或用环境变量覆盖；本命令仅提供交互式向导。
+> 建议把含敏感信息的字段（如 `apiKey`）放在全局配置或用环境变量覆盖，避免提交进项目仓库。
 
 ## Agent 工具
 

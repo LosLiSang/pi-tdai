@@ -3,16 +3,32 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  assignNested,
+  CONFIG_KEYS,
+  coerceValue,
+  loadMemoryConfig,
+  resolveConfigPath,
+  resolveWriteScope,
+  setMemoryConfig,
+} from "../src/config.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Isolated fake global agent dir so tests never touch the real ~/.pi/agent.
+const fakeAgentDir = vi.hoisted(() => {
+  const base = process.env.TEMP || process.env.TMPDIR || process.env.TMP || "/tmp";
+  return `${base}/pi-tdai-agent-${process.pid}`;
+});
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   CONFIG_DIR_NAME: ".pi",
-  getAgentDir: () => join(tmpdir(), "pi-tdai-empty-agent-dir"),
+  getAgentDir: () => fakeAgentDir,
 }));
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
   while (cleanup.length > 0) await cleanup.pop()?.();
+  await rm(fakeAgentDir, { recursive: true, force: true });
 });
 
 describe("pi extension integration", () => {
@@ -138,5 +154,330 @@ describe("pi extension integration", () => {
     });
     expect(appended).toHaveLength(1);
     expect(appended[0].customType).toBe("tdai-memory-cursor");
+  });
+
+  it("stays disabled without any global or project config, even with env vars", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-no-config-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const loaded = await loadMemoryConfig(cwd, true, {
+      TDAI_MEMORY_TEAM_ID: "env-team",
+      TDAI_MEMORY_AGENT_ID: "env-agent",
+      TDAI_MEMORY_USER_ID: "env-user",
+    });
+
+    expect(loaded.valid).toBe(false);
+    expect(loaded.sources).toEqual([]);
+    expect(loaded.config.teamId).toBe("");
+    expect(loaded.config.agentId).toBe("");
+    expect(loaded.config.userId).toBe("");
+  });
+
+  it("activates from global config and lets env vars override it", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-global-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    await mkdir(fakeAgentDir, { recursive: true });
+    await writeFile(
+      join(fakeAgentDir, "tencentdb-agent-memory.json"),
+      JSON.stringify({ teamId: "global-team", agentId: "global-agent", userId: "global-user" }),
+    );
+
+    const loaded = await loadMemoryConfig(cwd, false, {
+      TDAI_MEMORY_AGENT_ID: "env-agent",
+    });
+
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("global-team");
+    expect(loaded.config.agentId).toBe("env-agent"); // env overrides global
+    expect(loaded.config.userId).toBe("global-user");
+    expect(loaded.sources).toEqual([
+      join(fakeAgentDir, "tencentdb-agent-memory.json"),
+      "environment",
+    ]);
+  });
+
+  it("lets project config override global config", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-override-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    await mkdir(fakeAgentDir, { recursive: true });
+    await writeFile(
+      join(fakeAgentDir, "tencentdb-agent-memory.json"),
+      JSON.stringify({ teamId: "global-team", agentId: "global-agent", userId: "global-user" }),
+    );
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "tencentdb-agent-memory.json"),
+      JSON.stringify({ teamId: "project-team", agentId: "project-agent", userId: "project-user" }),
+    );
+
+    const loaded = await loadMemoryConfig(cwd, true);
+
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("project-team");
+    expect(loaded.config.agentId).toBe("project-agent");
+    expect(loaded.config.userId).toBe("project-user");
+    // global path first, project path second
+    expect(loaded.sources).toEqual([
+      join(fakeAgentDir, "tencentdb-agent-memory.json"),
+      join(cwd, ".pi", "tencentdb-agent-memory.json"),
+    ]);
+  });
+
+  it("ignores project config when untrusted but still uses global config", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-untrusted-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    await mkdir(fakeAgentDir, { recursive: true });
+    await writeFile(
+      join(fakeAgentDir, "tencentdb-agent-memory.json"),
+      JSON.stringify({ teamId: "global-team", agentId: "global-agent", userId: "global-user" }),
+    );
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "tencentdb-agent-memory.json"),
+      JSON.stringify({ teamId: "project-team", agentId: "project-agent", userId: "project-user" }),
+    );
+
+    const loaded = await loadMemoryConfig(cwd, false);
+
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("global-team"); // project ignored
+    expect(loaded.sources).toEqual([join(fakeAgentDir, "tencentdb-agent-memory.json")]);
+  });
+});
+
+describe("config writing", () => {
+  it("coerces per key type and keeps numeric ids as strings", () => {
+    expect(coerceValue("timeoutMs", "10000").value).toBe(10000);
+    expect(coerceValue("recall.maxResults", "10").value).toBe(10);
+    expect(coerceValue("capture.enabled", "false").value).toBe(false);
+    expect(coerceValue("capture.enabled", "yes").value).toBe(true);
+    expect(coerceValue("userId", "5301323504").value).toBe("5301323504");
+    expect(coerceValue("timeoutMs", "x").error).toBeTruthy();
+    expect(coerceValue("capture.enabled", "maybe").error).toBeTruthy();
+    expect(CONFIG_KEYS).toContain("recall.maxResults");
+  });
+
+  it("assignNested builds dotted-key objects", () => {
+    const target: Record<string, unknown> = {};
+    assignNested(target, "teamId", "t1");
+    assignNested(target, "recall.maxResults", 10);
+    assignNested(target, "capture.enabled", false);
+    expect(target).toEqual({
+      teamId: "t1",
+      recall: { maxResults: 10 },
+      capture: { enabled: false },
+    });
+  });
+
+  it("resolveWriteScope picks project when a project config exists, else global", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-scope-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    expect(await resolveWriteScope(cwd)).toBe("global"); // no project file yet
+
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "tencentdb-agent-memory.json"), "{}");
+    expect(await resolveWriteScope(cwd)).toBe("project");
+  });
+
+  it("writes a new project config and reports created", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-write-project-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const result = await setMemoryConfig(cwd, "project", { teamId: "t1", agentId: "a1" });
+    expect(result.created).toBe(true);
+    expect(result.scope).toBe("project");
+    expect(result.path).toBe(resolveConfigPath(cwd, "project"));
+    expect(result.appliedKeys.sort()).toEqual(["agentId", "teamId"]);
+
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.config.teamId).toBe("t1");
+    expect(loaded.config.agentId).toBe("a1");
+  });
+
+  it("merges into an existing config, preserving other fields", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-merge-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    await setMemoryConfig(cwd, "project", { endpoint: "http://example:8420", teamId: "keep-me" });
+    const second = await setMemoryConfig(cwd, "project", { agentId: "a1" });
+    expect(second.created).toBe(false);
+
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.config.endpoint).toBe("http://example:8420"); // preserved
+    expect(loaded.config.teamId).toBe("keep-me"); // preserved
+    expect(loaded.config.agentId).toBe("a1"); // newly set
+  });
+
+  it("writes to the global scope path", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-write-global-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const result = await setMemoryConfig(cwd, "global", { teamId: "g-team" });
+    expect(result.path).toBe(resolveConfigPath(cwd, "global"));
+    expect(result.path).toBe(join(fakeAgentDir, "tencentdb-agent-memory.json"));
+
+    const loaded = await loadMemoryConfig(cwd, false);
+    expect(loaded.config.teamId).toBe("g-team");
+    expect(loaded.sources).toContain(join(fakeAgentDir, "tencentdb-agent-memory.json"));
+  });
+});
+
+describe("tdai-memory-config command", () => {
+  it("wizard writes to global on first run and reloads the client", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-wizard-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const fakePi = {
+      on() {},
+      registerTool() {},
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    // 向导交互序列：选作用域“自动（全局）” → endpoint 保留(空) → teamId/agentId/userId 新值 → 高级选“否” → 确认保存
+    const inputs = ["", "t1", "a1", "u1"];
+    let inputIdx = 0;
+    const selects = ["自动（推荐，当前目标：全局）", "否，直接保存"];
+    let selectIdx = 0;
+    const ctx = {
+      cwd,
+      mode: "interactive",
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: () => undefined,
+        input: async () => inputs[inputIdx++] ?? "",
+        select: async () => selects[selectIdx++] ?? "",
+        confirm: async () => true,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    const cmd = commands.get("tdai-memory-config");
+    expect(cmd).toBeTruthy();
+    await cmd!.handler("", ctx);
+
+    // 首次无 project 配置 + 选“自动” → 写 global
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("t1");
+    expect(loaded.config.agentId).toBe("a1");
+    expect(loaded.config.userId).toBe("u1");
+    expect(loaded.sources).toContain(join(fakeAgentDir, "tencentdb-agent-memory.json"));
+  });
+
+  it("wizard writes to project when manually selected", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-wizard-project-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const fakePi = {
+      on() {},
+      registerTool() {},
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    // 虽然没有任何配置（自动会选全局），手动选择“项目配置” → 写 project
+    const inputs = ["", "t1", "a1", "u1"];
+    let inputIdx = 0;
+    const selects = ["项目配置（当前项目 .pi/）", "否，直接保存"];
+    let selectIdx = 0;
+    const ctx = {
+      cwd,
+      mode: "interactive",
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: () => undefined,
+        input: async () => inputs[inputIdx++] ?? "",
+        select: async () => selects[selectIdx++] ?? "",
+        confirm: async () => true,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    const cmd = commands.get("tdai-memory-config");
+    await cmd!.handler("", ctx);
+
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("t1");
+    expect(loaded.sources).toContain(join(cwd, ".pi", "tencentdb-agent-memory.json"));
+  });
+
+  it("prints a hint and writes nothing in non-interactive (print) mode", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-print-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const fakePi = {
+      on() {},
+      registerTool() {},
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const ctx = {
+      cwd,
+      mode: "print",
+      hasUI: false,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: () => undefined,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    const cmd = commands.get("tdai-memory-config");
+    await cmd!.handler("", ctx);
+
+    expect(logSpy).toHaveBeenCalled();
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.valid).toBe(false); // 未写任何配置
+    logSpy.mockRestore();
   });
 });

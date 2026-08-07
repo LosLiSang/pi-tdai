@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ConfigLoadResult, MemoryConfig } from "./types.js";
 
@@ -169,33 +169,53 @@ function normalizeConfig(raw: JsonObject): MemoryConfig {
   };
 }
 
+export const CONFIG_FILE_NAME = "tencentdb-agent-memory.json";
+
 export async function loadMemoryConfig(
   cwd: string,
   projectTrusted: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ConfigLoadResult> {
-  const globalPath = join(getAgentDir(), "tencentdb-agent-memory.json");
-  const projectPath = join(cwd, CONFIG_DIR_NAME, "tencentdb-agent-memory.json");
+  const globalPath = join(getAgentDir(), CONFIG_FILE_NAME);
+  const projectPath = join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
   const sources: string[] = [];
   const diagnostics: string[] = [];
   let merged: JsonObject = DEFAULT_CONFIG as unknown as JsonObject;
+  let configured = false;
 
+  // 1. Global config (~/.pi/agent/tencentdb-agent-memory.json) as the base.
+  //    It is user-owned, so it is read regardless of project trust and acts
+  //    as the fallback for any pi project without a local override.
   const global = await readJsonObject(globalPath);
   if (global.found) sources.push(globalPath);
   if (global.error) diagnostics.push(global.error);
-  if (global.value) merged = mergeConfig(merged, global.value);
+  if (global.value) {
+    configured = true;
+    merged = mergeConfig(merged, global.value);
+  }
 
+  // 2. Project config (<cwd>/.pi/tencentdb-agent-memory.json) overrides the
+  //    global one. Only read when the project is trusted — pi's safety
+  //    boundary prevents untrusted projects from injecting settings.
   if (projectTrusted) {
     const project = await readJsonObject(projectPath);
     if (project.found) sources.push(projectPath);
     if (project.error) diagnostics.push(project.error);
-    if (project.value) merged = mergeConfig(merged, project.value);
+    if (project.value) {
+      configured = true;
+      merged = mergeConfig(merged, project.value);
+    }
   }
 
-  const envConfig = environmentConfig(env);
-  if (Object.keys(envConfig).length > 0) {
-    sources.push("environment");
-    merged = mergeConfig(merged, envConfig);
+  // 3. Environment variables override file config (useful for secrets), but
+  //    only when a file config opted in (global or project). Env alone must
+  //    not activate the plugin for arbitrary projects.
+  if (configured) {
+    const envConfig = environmentConfig(env);
+    if (Object.keys(envConfig).length > 0) {
+      sources.push("environment");
+      merged = mergeConfig(merged, envConfig);
+    }
   }
 
   const config = normalizeConfig(merged);
@@ -221,7 +241,138 @@ export async function loadMemoryConfig(
 
 export function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
   return {
-    globalPath: join(getAgentDir(), "tencentdb-agent-memory.json"),
-    projectPath: join(cwd, CONFIG_DIR_NAME, "tencentdb-agent-memory.json"),
+    globalPath: join(getAgentDir(), CONFIG_FILE_NAME),
+    projectPath: join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME),
+  };
+}
+
+// ===========================================================================
+// Config writing (for /tdai-memory-config)
+// ===========================================================================
+
+export type ConfigScope = "project" | "global";
+
+/** Known top-level and nested keys, used for shell completion and docs. */
+export const CONFIG_KEYS = [
+  "endpoint",
+  "apiKey",
+  "serviceId",
+  "teamId",
+  "agentId",
+  "userId",
+  "taskId",
+  "sessionPrefix",
+  "timeoutMs",
+  "tls.rejectUnauthorized",
+  "recall.enabled",
+  "recall.maxResults",
+  "recall.includePersona",
+  "recall.includeScenarios",
+  "recall.maxScenarios",
+  "recall.maxContextChars",
+  "capture.enabled",
+  "capture.stripAssistantCodeBlocks",
+] as const;
+
+const NUMERIC_KEYS = new Set([
+  "timeoutMs",
+  "recall.maxResults",
+  "recall.maxScenarios",
+  "recall.maxContextChars",
+]);
+
+const BOOLEAN_KEYS = new Set([
+  "tls.rejectUnauthorized",
+  "recall.enabled",
+  "recall.includePersona",
+  "recall.includeScenarios",
+  "capture.enabled",
+  "capture.stripAssistantCodeBlocks",
+]);
+
+export function resolveConfigPath(cwd: string, scope: ConfigScope): string {
+  return scope === "global"
+    ? join(getAgentDir(), CONFIG_FILE_NAME)
+    : join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+}
+
+/** Decide which scope new config should be written to: project if a project
+ * config file already exists, otherwise global. Based on file existence only,
+ * independent of project trust (writing is a user-initiated action). */
+export async function resolveWriteScope(cwd: string): Promise<ConfigScope> {
+  const projectPath = join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  const project = await readJsonObject(projectPath);
+  return project.found ? "project" : "global";
+}
+
+/** Coerce a raw string value based on the (dotted) key's expected type.
+ * Unknown keys are kept as strings, so a numeric userId like "5301323504"
+ * is preserved instead of being turned into a JSON number. */
+export function coerceValue(dottedKey: string, raw: string): { value: unknown; error?: string } {
+  if (NUMERIC_KEYS.has(dottedKey)) {
+    if (!/^-?\d+(\.\d+)?$/.test(raw)) {
+      return { value: raw, error: `${dottedKey} 应为数字，收到 "${raw}"` };
+    }
+    return { value: Number(raw) };
+  }
+  if (BOOLEAN_KEYS.has(dottedKey)) {
+    const lower = raw.toLowerCase();
+    if (["1", "true", "yes", "on"].includes(lower)) return { value: true };
+    if (["0", "false", "no", "off"].includes(lower)) return { value: false };
+    return { value: raw, error: `${dottedKey} 应为布尔值(true/false)，收到 "${raw}"` };
+  }
+  return { value: raw };
+}
+
+/** Assign a value into a nested object using a dotted key (e.g. "recall.maxResults"). */
+export function assignNested(target: JsonObject, dottedKey: string, value: unknown): void {
+  const parts = dottedKey.split(".");
+  let node = target;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (!isObject(node[part])) node[part] = {};
+    node = node[part] as JsonObject;
+  }
+  node[parts[parts.length - 1]] = value;
+}
+
+function flattenKeys(obj: JsonObject, prefix = ""): string[] {
+  const keys: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (isObject(v)) keys.push(...flattenKeys(v, path));
+    else keys.push(path);
+  }
+  return keys;
+}
+
+export interface SetConfigResult {
+  scope: ConfigScope;
+  path: string;
+  created: boolean;
+  appliedKeys: string[];
+}
+
+/** Merge `updates` into the scope's config file, preserving other fields. */
+export async function setMemoryConfig(
+  cwd: string,
+  scope: ConfigScope,
+  updates: JsonObject,
+): Promise<SetConfigResult> {
+  const path = resolveConfigPath(cwd, scope);
+  const existing = await readJsonObject(path);
+  if (existing.error) throw new Error(existing.error);
+
+  const base = existing.value ?? {};
+  const merged = mergeConfig(base, updates);
+
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+
+  return {
+    scope,
+    path,
+    created: !existing.found,
+    appliedKeys: flattenKeys(updates),
   };
 }

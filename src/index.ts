@@ -1,7 +1,15 @@
 import { MemoryClient } from "@tencentdb-agent-memory/memory-sdk-ts-v2/v3";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { getConfigPaths, loadMemoryConfig } from "./config.js";
+import {
+  assignNested,
+  coerceValue,
+  type ConfigScope,
+  getConfigPaths,
+  loadMemoryConfig,
+  resolveWriteScope,
+  setMemoryConfig,
+} from "./config.js";
 import { escapeMemoryText, formatRecallContext, truncateText } from "./format.js";
 import {
   buildSessionId,
@@ -37,6 +45,30 @@ interface RuntimeState {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function getNested(obj: unknown, dotted: string): unknown {
+  const parts = dotted.split(".");
+  let node: unknown = obj;
+  for (const part of parts) {
+    node = node != null && typeof node === "object" && !Array.isArray(node)
+      ? (node as Record<string, unknown>)[part]
+      : undefined;
+  }
+  return node;
+}
+
+function dottedKeys(obj: Record<string, unknown>, prefix = ""): string[] {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (v != null && typeof v === "object" && !Array.isArray(v)) {
+      out.push(...dottedKeys(v as Record<string, unknown>, path));
+    } else {
+      out.push(path);
+    }
+  }
+  return out;
 }
 
 function createClient(loaded: ConfigLoadResult): Client {
@@ -176,7 +208,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
     if (!state.client && ctx.hasUI) {
       const paths = getConfigPaths(ctx.cwd);
       ctx.ui.notify(
-        `TencentDB Agent Memory 尚未配置。可创建 ${paths.globalPath} 或 ${paths.projectPath}`,
+        `TencentDB Agent Memory 尚未配置。可在全局 ${paths.globalPath} 或当前项目 ${paths.projectPath} 创建配置`,
         "warning",
       );
     }
@@ -393,6 +425,131 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
 
       if (ctx.hasUI) ctx.ui.notify(output, state.client ? "info" : "warning");
       else console.log(output);
+    },
+  });
+
+  pi.registerCommand("tdai-memory-config", {
+    description: "交互式配置 TencentDB Agent Memory（向导：自动选 project/global 作用域，预填生效值，增量保存）",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        console.log("TencentDB Agent Memory 配置向导需要在交互式 pi 中运行（当前为非交互模式）。");
+        return;
+      }
+      const ui = ctx.ui;
+
+      // 预填 = 当前生效合并值（global 底 + project 覆盖），与 pi 实际读取一致
+      const initial = await loadMemoryConfig(ctx.cwd, ctx.isProjectTrusted());
+      const current = initial.config;
+
+      // 写入目标：默认自动（project 配置文件存在则写 project，否则 global），可手动指定
+      const autoScope = await resolveWriteScope(ctx.cwd);
+      const paths = getConfigPaths(ctx.cwd);
+      const scopeChoice = await ui.select("写入到哪个配置文件？", [
+        `自动（推荐，当前目标：${autoScope === "project" ? "项目" : "全局"}）`,
+        "项目配置（当前项目 .pi/）",
+        "全局配置（~/.pi/agent/）",
+      ]);
+      const scope: ConfigScope =
+        scopeChoice === "项目配置（当前项目 .pi/）"
+          ? "project"
+          : scopeChoice === "全局配置（~/.pi/agent/）"
+            ? "global"
+            : autoScope;
+      const targetPath = scope === "project" ? paths.projectPath : paths.globalPath;
+
+      const updates: Record<string, unknown> = {};
+      const effective = (dotted: string): unknown => {
+        const changed = getNested(updates, dotted);
+        return changed !== undefined ? changed : getNested(current, dotted);
+      };
+      const asString = (dotted: string): string => {
+        const value = effective(dotted);
+        return value == null ? "" : String(value);
+      };
+
+      ui.notify(`写入目标：${scope === "project" ? "项目" : "全局"}配置 ${targetPath}`, "info");
+
+      // 核心字段（向导式逐个 input；空回车或 Esc = 保留当前值）
+      const core: Array<{ key: string; required: boolean }> = [
+        { key: "endpoint", required: false },
+        { key: "teamId", required: true },
+        { key: "agentId", required: true },
+        { key: "userId", required: true },
+      ];
+      for (const field of core) {
+        const cur = asString(field.key);
+        const entered = await ui.input(
+          `${field.key}${field.required ? "（必填）" : ""}${cur ? `，当前 ${cur}` : ""}，回车保留`,
+          cur || undefined,
+        );
+        // undefined(Esc) 或 ""(空回车) 视为保留；非空且与当前不同才记为改动
+        if (entered && entered !== cur) assignNested(updates, field.key, entered);
+      }
+
+      // 必填校验（基于改动后的有效值）
+      const missingRequired = core.filter((field) => field.required && !asString(field.key));
+      if (missingRequired.length) {
+        ui.notify(`必填字段为空：${missingRequired.map((field) => field.key).join(", ")}。未保存。`, "warning");
+        return;
+      }
+
+      // 高级设置（recall / capture / tls）
+      const adjust = await ui.select("是否调整高级设置（recall / capture / tls）？", [
+        "否，直接保存",
+        "是，逐项调整",
+      ]);
+      if (adjust === "是，逐项调整") {
+        const advanced: Array<{ key: string; type: "bool" | "num" }> = [
+          { key: "recall.enabled", type: "bool" },
+          { key: "recall.maxResults", type: "num" },
+          { key: "recall.maxContextChars", type: "num" },
+          { key: "capture.enabled", type: "bool" },
+          { key: "capture.stripAssistantCodeBlocks", type: "bool" },
+          { key: "tls.rejectUnauthorized", type: "bool" },
+        ];
+        for (const field of advanced) {
+          if (field.type === "bool") {
+            const cur = Boolean(effective(field.key));
+            const choice = await ui.select(`${field.key}（当前 ${cur}）`, ["true", "false"]);
+            if (choice === undefined) continue; // Esc 跳过
+            const coerced = coerceValue(field.key, choice);
+            if (coerced.value !== cur) assignNested(updates, field.key, coerced.value);
+          } else {
+            const cur = asString(field.key);
+            const entered = await ui.input(`${field.key}（当前 ${cur || "默认"}）`, cur || undefined);
+            if (!entered) continue;
+            const coerced = coerceValue(field.key, entered);
+            assignNested(updates, field.key, coerced.value);
+          }
+        }
+      }
+
+      const changed = dottedKeys(updates);
+      if (changed.length === 0) {
+        ui.notify("没有字段被修改，未保存。", "info");
+        return;
+      }
+
+      const ok = await ui.confirm(
+        "保存配置？",
+        `写入${scope === "project" ? "项目" : "全局"}配置：${targetPath}\n字段：${changed.join(", ")}`,
+      );
+      if (!ok) {
+        ui.notify("已取消，未保存。", "info");
+        return;
+      }
+
+      try {
+        const result = await setMemoryConfig(ctx.cwd, scope, updates);
+        await configure(ctx, false);
+        const ready = Boolean(state.client);
+        ui.notify(
+          `已保存到 ${result.path}。${ready ? "插件已重新加载并启用。" : "插件未启用，请检查必填字段。"}`,
+          ready ? "info" : "warning",
+        );
+      } catch (error) {
+        ui.notify(`保存失败：${errorMessage(error)}`, "error");
+      }
     },
   });
 }
