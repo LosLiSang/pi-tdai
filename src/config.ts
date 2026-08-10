@@ -252,28 +252,6 @@ export function getConfigPaths(cwd: string): { globalPath: string; projectPath: 
 
 export type ConfigScope = "project" | "global";
 
-/** Known top-level and nested keys, used for shell completion and docs. */
-export const CONFIG_KEYS = [
-  "endpoint",
-  "apiKey",
-  "serviceId",
-  "teamId",
-  "agentId",
-  "userId",
-  "taskId",
-  "sessionPrefix",
-  "timeoutMs",
-  "tls.rejectUnauthorized",
-  "recall.enabled",
-  "recall.maxResults",
-  "recall.includePersona",
-  "recall.includeScenarios",
-  "recall.maxScenarios",
-  "recall.maxContextChars",
-  "capture.enabled",
-  "capture.stripAssistantCodeBlocks",
-] as const;
-
 const NUMERIC_KEYS = new Set([
   "timeoutMs",
   "recall.maxResults",
@@ -324,6 +302,22 @@ export function coerceValue(dottedKey: string, raw: string): { value: unknown; e
   return { value: raw };
 }
 
+// ===========================================================================
+// Dotted-path helpers (shared by config loading, writing and the wizard)
+// ===========================================================================
+
+/** Read a value at a dotted path (e.g. "recall.maxResults"), or undefined. */
+export function getNested(obj: unknown, dotted: string): unknown {
+  const parts = dotted.split(".");
+  let node: unknown = obj;
+  for (const part of parts) {
+    node = node != null && typeof node === "object" && !Array.isArray(node)
+      ? (node as Record<string, unknown>)[part]
+      : undefined;
+  }
+  return node;
+}
+
 /** Assign a value into a nested object using a dotted key (e.g. "recall.maxResults"). */
 export function assignNested(target: JsonObject, dottedKey: string, value: unknown): void {
   const parts = dottedKey.split(".");
@@ -336,11 +330,12 @@ export function assignNested(target: JsonObject, dottedKey: string, value: unkno
   node[parts[parts.length - 1]] = value;
 }
 
-function flattenKeys(obj: JsonObject, prefix = ""): string[] {
+/** Flatten a nested object into dotted keys (e.g. { recall: { maxResults: 5 } } → ["recall.maxResults"]). */
+export function dottedKeys(obj: JsonObject, prefix = ""): string[] {
   const keys: string[] = [];
   for (const [k, v] of Object.entries(obj)) {
     const path = prefix ? `${prefix}.${k}` : k;
-    if (isObject(v)) keys.push(...flattenKeys(v, path));
+    if (isObject(v)) keys.push(...dottedKeys(v, path));
     else keys.push(path);
   }
   return keys;
@@ -373,6 +368,6 @@ export async function setMemoryConfig(
     scope,
     path,
     created: !existing.found,
-    appliedKeys: flattenKeys(updates),
+    appliedKeys: dottedKeys(updates),
   };
 }

@@ -5,7 +5,9 @@ import {
   assignNested,
   coerceValue,
   type ConfigScope,
+  dottedKeys,
   getConfigPaths,
+  getNested,
   loadMemoryConfig,
   resolveWriteScope,
   setMemoryConfig,
@@ -45,30 +47,6 @@ interface RuntimeState {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function getNested(obj: unknown, dotted: string): unknown {
-  const parts = dotted.split(".");
-  let node: unknown = obj;
-  for (const part of parts) {
-    node = node != null && typeof node === "object" && !Array.isArray(node)
-      ? (node as Record<string, unknown>)[part]
-      : undefined;
-  }
-  return node;
-}
-
-function dottedKeys(obj: Record<string, unknown>, prefix = ""): string[] {
-  const out: string[] = [];
-  for (const [k, v] of Object.entries(obj)) {
-    const path = prefix ? `${prefix}.${k}` : k;
-    if (v != null && typeof v === "object" && !Array.isArray(v)) {
-      out.push(...dottedKeys(v as Record<string, unknown>, path));
-    } else {
-      out.push(path);
-    }
-  }
-  return out;
 }
 
 function createClient(loaded: ConfigLoadResult): Client {
@@ -513,12 +491,17 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
             const choice = await ui.select(`${field.key}（当前 ${cur}）`, ["true", "false"]);
             if (choice === undefined) continue; // Esc 跳过
             const coerced = coerceValue(field.key, choice);
+            if (coerced.error) continue; // 防御：选择器只出 true/false，理论不可达
             if (coerced.value !== cur) assignNested(updates, field.key, coerced.value);
           } else {
             const cur = asString(field.key);
             const entered = await ui.input(`${field.key}（当前 ${cur || "默认"}）`, cur || undefined);
             if (!entered) continue;
             const coerced = coerceValue(field.key, entered);
+            if (coerced.error) {
+              ui.notify(coerced.error, "warning");
+              continue; // 非法输入不写入，保留原值
+            }
             assignNested(updates, field.key, coerced.value);
           }
         }

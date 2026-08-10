@@ -1,11 +1,10 @@
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   assignNested,
-  CONFIG_KEYS,
   coerceValue,
   loadMemoryConfig,
   resolveConfigPath,
@@ -257,7 +256,6 @@ describe("config writing", () => {
     expect(coerceValue("userId", "5301323504").value).toBe("5301323504");
     expect(coerceValue("timeoutMs", "x").error).toBeTruthy();
     expect(coerceValue("capture.enabled", "maybe").error).toBeTruthy();
-    expect(CONFIG_KEYS).toContain("recall.maxResults");
   });
 
   it("assignNested builds dotted-key objects", () => {
@@ -434,6 +432,74 @@ describe("tdai-memory-config command", () => {
     expect(loaded.valid).toBe(true);
     expect(loaded.config.teamId).toBe("t1");
     expect(loaded.sources).toContain(join(cwd, ".pi", "tencentdb-agent-memory.json"));
+  });
+
+  it("wizard rejects invalid numeric input instead of writing garbage", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-wizard-invalid-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const fakePi = {
+      on() {},
+      registerTool() {},
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    // 向导序列：作用域“自动(全局)” → 核心4字段 → 高级选“是” →
+    // recall.enabled=true → recall.maxResults="abc"(非法) → recall.maxContextChars=""(保留)
+    // → capture.enabled=true → capture.stripAssistantCodeBlocks=true → tls.rejectUnauthorized=true → 确认
+    const inputs = ["", "t1", "a1", "u1", "abc", ""];
+    let inputIdx = 0;
+    const selects = [
+      "自动（推荐，当前目标：全局）",
+      "是，逐项调整",
+      "true",
+      "true",
+      "true",
+      "true",
+    ];
+    let selectIdx = 0;
+    const notifications: string[] = [];
+    const ctx = {
+      cwd,
+      mode: "interactive",
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: (message: string) => notifications.push(message),
+        input: async () => inputs[inputIdx++] ?? "",
+        select: async () => selects[selectIdx++] ?? "",
+        confirm: async () => true,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    const cmd = commands.get("tdai-memory-config");
+    await cmd!.handler("", ctx);
+
+    // 非法数值被提示且未写入
+    expect(notifications.some((m) => m.includes("recall.maxResults"))).toBe(true);
+    const raw = await readFile(join(fakeAgentDir, "tencentdb-agent-memory.json"), "utf8");
+    expect(raw).not.toContain("abc");
+
+    // 其余字段正常保存，recall.maxResults 保持默认（未写成字符串）
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.valid).toBe(true);
+    expect(loaded.config.teamId).toBe("t1");
+    expect(loaded.config.recall.maxResults).toBe(5);
   });
 
   it("prints a hint and writes nothing in non-interactive (print) mode", async () => {
