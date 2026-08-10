@@ -6,6 +6,7 @@ import type { ConfigLoadResult, MemoryConfig } from "./types.js";
 type JsonObject = Record<string, unknown>;
 
 const DEFAULT_CONFIG: MemoryConfig = {
+  enabled: true,
   endpoint: "http://127.0.0.1:8420",
   apiKey: "",
   serviceId: "default",
@@ -99,6 +100,7 @@ function environmentConfig(env: NodeJS.ProcessEnv): JsonObject {
   });
 
   return compactObject({
+    enabled: parseBoolean(env.TDAI_MEMORY_ENABLED),
     endpoint: env.TDAI_MEMORY_ENDPOINT,
     apiKey: env.TDAI_MEMORY_API_KEY,
     serviceId: env.TDAI_MEMORY_INSTANCE_ID ?? env.TDAI_MEMORY_SERVICE_ID,
@@ -134,6 +136,7 @@ function normalizeConfig(raw: JsonObject): MemoryConfig {
 
   const taskId = stringValue(raw.taskId);
   return {
+    enabled: booleanValue(raw.enabled, DEFAULT_CONFIG.enabled),
     endpoint: stringValue(raw.endpoint, DEFAULT_CONFIG.endpoint).replace(/\/+$/, ""),
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey : "",
     serviceId: stringValue(raw.serviceId, DEFAULT_CONFIG.serviceId),

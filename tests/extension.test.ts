@@ -351,7 +351,7 @@ describe("tdai-memory-config command", () => {
     // 向导交互序列：选作用域“自动（全局）” → endpoint 保留(空) → teamId/agentId/userId 新值 → 高级选“否” → 确认保存
     const inputs = ["", "t1", "a1", "u1"];
     let inputIdx = 0;
-    const selects = ["自动（推荐，当前目标：全局）", "否，直接保存"];
+    const selects = ["自动（推荐，当前目标：全局）", "启用 TDAI memory", "否，直接保存"];
     let selectIdx = 0;
     const ctx = {
       cwd,
@@ -407,7 +407,7 @@ describe("tdai-memory-config command", () => {
     // 虽然没有任何配置（自动会选全局），手动选择“项目配置” → 写 project
     const inputs = ["", "t1", "a1", "u1"];
     let inputIdx = 0;
-    const selects = ["项目配置（当前项目 .pi/）", "否，直接保存"];
+    const selects = ["项目配置（当前项目 .pi/）", "启用 TDAI memory", "否，直接保存"];
     let selectIdx = 0;
     const ctx = {
       cwd,
@@ -463,6 +463,7 @@ describe("tdai-memory-config command", () => {
     let inputIdx = 0;
     const selects = [
       "自动（推荐，当前目标：全局）",
+      "启用 TDAI memory",
       "是，逐项调整",
       "true",
       "true",
@@ -545,5 +546,108 @@ describe("tdai-memory-config command", () => {
     const loaded = await loadMemoryConfig(cwd, true);
     expect(loaded.valid).toBe(false); // 未写任何配置
     logSpy.mockRestore();
+  });
+
+  it("wizard can disable TDAI memory and skips the rest of the fields", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-wizard-disable-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const fakePi = {
+      on() {},
+      registerTool() {},
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    // 作用域“自动(全局)” → enabled 选“禁用” → 确认；不再问核心/高级字段
+    const notifications: string[] = [];
+    const ctx = {
+      cwd,
+      mode: "interactive",
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: (message: string) => notifications.push(message),
+        input: async () => {
+          throw new Error("禁用模式下不应再询问字段");
+        },
+        select: async () => "禁用 TDAI memory",
+        confirm: async () => true,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    const cmd = commands.get("tdai-memory-config");
+    await cmd!.handler("", ctx);
+
+    // 只写 enabled:false，不写任何核心字段；并提示已禁用
+    const loaded = await loadMemoryConfig(cwd, true);
+    expect(loaded.config.enabled).toBe(false);
+    expect(loaded.config.teamId).toBe("");
+    expect(notifications.some((m) => m.includes("已禁用"))).toBe(true);
+  });
+
+  it("search tools report disabled when enabled=false", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-disabled-tool-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: ExtensionContext) => Promise<void> }
+    >();
+    const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+    const fakePi = {
+      on() {},
+      registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+        tools.set(def.name, def);
+      },
+      registerCommand(
+        name: string,
+        opts: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+      ) {
+        commands.set(name, opts);
+      },
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    // 先把配置保存为禁用状态
+    const ctx = {
+      cwd,
+      mode: "interactive",
+      hasUI: true,
+      isProjectTrusted: () => true,
+      ui: {
+        theme: { fg: (_color: string, text: string) => text },
+        setStatus: () => undefined,
+        notify: () => undefined,
+        input: async () => {
+          throw new Error("不应询问字段");
+        },
+        select: async () => "禁用 TDAI memory",
+        confirm: async () => true,
+      },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+    await commands.get("tdai-memory-config")!.handler("", ctx);
+
+    // 工具应报“已禁用”而不是返回结果
+    const search = tools.get("tdai_memory_search");
+    expect(search).toBeTruthy();
+    await expect(search!.execute("call-1", { query: "test" })).rejects.toThrow(/已禁用/);
   });
 });

@@ -72,6 +72,9 @@ function setStatus(ctx: ExtensionContext, kind: "ready" | "working" | "warning",
 
 function getClientOrThrow(state: RuntimeState): Client {
   if (state.client) return state.client;
+  if (state.loaded?.config.enabled === false) {
+    throw new Error("TDAI memory 已禁用（enabled=false）。如需启用请运行 /tdai-memory-config 或修改配置。");
+  }
   const loaded = state.loaded;
   const details = loaded?.missing.length
     ? `缺少 ${loaded.missing.join(", ")}`
@@ -113,7 +116,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
     state.loaded = loaded;
     state.client = undefined;
 
-    if (loaded.valid) {
+    if (loaded.valid && loaded.config.enabled) {
       try {
         state.client = createClient(loaded);
         setStatus(ctx, "ready", "TDAI memory ready");
@@ -123,6 +126,13 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
         setStatus(ctx, "warning", "TDAI memory error");
         if (notify && ctx.hasUI) ctx.ui.notify(errorMessage(error), "error");
       }
+      return;
+    }
+
+    // 总闸关闭：不建 client、不连网关，工具会报“已禁用”
+    if (!loaded.config.enabled) {
+      setStatus(ctx, "warning", "TDAI memory 已禁用");
+      if (notify && ctx.hasUI) ctx.ui.notify("TDAI memory 已禁用（enabled=false）", "warning");
       return;
     }
 
@@ -183,7 +193,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
     await configure(ctx, false);
     restoreSessionCursor(ctx);
 
-    if (!state.client && ctx.hasUI) {
+    if (!state.client && ctx.hasUI && state.loaded?.config.enabled !== false) {
       const paths = getConfigPaths(ctx.cwd);
       ctx.ui.notify(
         `TencentDB Agent Memory 尚未配置。可在全局 ${paths.globalPath} 或当前项目 ${paths.projectPath} 创建配置`,
@@ -385,6 +395,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
 
       const output = [
         "TencentDB Agent Memory",
+        `enabled: ${loaded.config.enabled}`,
         `ready: ${Boolean(state.client)}`,
         `endpoint: ${loaded.config.endpoint}`,
         `service/team/agent/user: ${loaded.config.serviceId} / ${loaded.config.teamId || "-"} / ${loaded.config.agentId || "-"} / ${loaded.config.userId || "-"}`,
@@ -446,6 +457,46 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
       };
 
       ui.notify(`写入目标：${scope === "project" ? "项目" : "全局"}配置 ${targetPath}`, "info");
+
+      // 总开关（向导第一步，作用域之后）：选“禁用”直接保存结束，不再填其他字段
+      const enabledCur = effective("enabled") !== false;
+      const enabledChoice = await ui.select(
+        `是否启用 TDAI memory？（当前${enabledCur ? "启用" : "禁用"}）`,
+        ["启用 TDAI memory", "禁用 TDAI memory"],
+      );
+      let wantEnabled = enabledCur;
+      if (enabledChoice === "启用 TDAI memory") wantEnabled = true;
+      else if (enabledChoice === "禁用 TDAI memory") wantEnabled = false;
+      // undefined(Esc) 保留当前
+      if (wantEnabled !== enabledCur) assignNested(updates, "enabled", wantEnabled);
+
+      if (!wantEnabled) {
+        const changed = dottedKeys(updates);
+        if (changed.length === 0) {
+          ui.notify("配置未修改（TDAI memory 已是禁用状态）。", "info");
+          return;
+        }
+        const ok = await ui.confirm(
+          "保存配置？",
+          `写入${scope === "project" ? "项目" : "全局"}配置：${targetPath}\n字段：${changed.join(", ")}`,
+        );
+        if (!ok) {
+          ui.notify("已取消，未保存。", "info");
+          return;
+        }
+        try {
+          const result = await setMemoryConfig(ctx.cwd, scope, updates);
+          await configure(ctx, false);
+          const disabled = state.loaded?.config.enabled === false;
+          ui.notify(
+            `已保存到 ${result.path}。${disabled ? "TDAI memory 已禁用。" : "插件已重新加载并启用。"}`,
+            disabled ? "warning" : "info",
+          );
+        } catch (error) {
+          ui.notify(`保存失败：${errorMessage(error)}`, "error");
+        }
+        return;
+      }
 
       // 核心字段（向导式逐个 input；空回车或 Esc = 保留当前值）
       const core: Array<{ key: string; required: boolean }> = [
@@ -525,9 +576,15 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI): void {
       try {
         const result = await setMemoryConfig(ctx.cwd, scope, updates);
         await configure(ctx, false);
+        const disabled = state.loaded?.config.enabled === false;
         const ready = Boolean(state.client);
+        const tail = ready
+          ? "插件已重新加载并启用。"
+          : disabled
+            ? "TDAI memory 已禁用（enabled=false）。"
+            : "插件未启用，请检查必填字段。";
         ui.notify(
-          `已保存到 ${result.path}。${ready ? "插件已重新加载并启用。" : "插件未启用，请检查必填字段。"}`,
+          `已保存到 ${result.path}。${tail}`,
           ready ? "info" : "warning",
         );
       } catch (error) {

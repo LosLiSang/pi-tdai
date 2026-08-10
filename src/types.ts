@@ -17,6 +17,7 @@ export interface TlsConfig {
 }
 
 export interface MemoryConfig {
+  enabled: boolean;
   endpoint: string;
   apiKey: string;
   serviceId: string;

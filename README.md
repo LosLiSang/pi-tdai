@@ -97,10 +97,20 @@ pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 没有全局且没有项目配置文件时，即使设置了环境变量，也不会启用 TDAI Memory。
 
+### `enabled` 总开关
+
+顶层 `enabled`（默认 `true`）控制是否启动 TDAI Memory：
+
+- `true`（默认）：正常连接网关，自动 recall/capture，三个搜索工具可用。
+- `false`：**总闸全关**——不创建 client、不连接网关、不自动 recall/capture，`tdai_memory_search` / `tdai_conversation_search` / `tdai_scenario_read` 调用时报“已禁用”，`/tdai-memory-status` 显示 `enabled: false`。
+
+不写该字段等同于 `true`，现有配置不受影响。可单独用环境变量 `TDAI_MEMORY_ENABLED=false` 临时关闭（`1/0`、`true/false`、`yes/no`、`on/off`）。
+
 可复制 [`config.example.json`](./config.example.json) 到上述任一位置：
 
 ```json
 {
+  "enabled": true,
   "endpoint": "http://127.0.0.1:8420",
   "apiKey": "",
   "serviceId": "default",
@@ -132,6 +142,7 @@ pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 | 环境变量 | 对应配置 |
 |---|---|
+| `TDAI_MEMORY_ENABLED` | `enabled` |
 | `TDAI_MEMORY_ENDPOINT` | `endpoint` |
 | `TDAI_MEMORY_API_KEY` | `apiKey` |
 | `TDAI_MEMORY_INSTANCE_ID` / `TDAI_MEMORY_SERVICE_ID` | `serviceId` |
@@ -175,8 +186,9 @@ pi 安装 Git/npm package 时会自动执行 `npm install`。
 
 向导行为：
 
+- **总开关（第一步）**：先问“是否启用 TDAI memory？”；选“禁用”直接确认保存 `enabled: false` 并结束，不再询问其他字段；选“启用”继续后续步骤。
 - **预填当前生效值**：打开即展示 pi 实际读取的配置（global 为底 + project 覆盖），所见即现状。
-- **写入目标可选**：向导第一步让你选择写到哪里——`自动`（项目已有 `.pi/tencentdb-agent-memory.json` 则写项目，否则写全局 `~/.pi/agent/`）、`项目配置`（当前项目 `.pi/`）或 `全局配置`（`~/.pi/agent/`）。选“自动”或按 Esc 时按默认规则。
+- **写入目标可选**：选完总开关后选择写到哪里——`自动`（项目已有 `.pi/tencentdb-agent-memory.json` 则写项目，否则写全局 `~/.pi/agent/`）、`项目配置`（当前项目 `.pi/`）或 `全局配置`（`~/.pi/agent/`）。选“自动”或按 Esc 时按默认规则。
 - **增量保存**：只写你改动过的字段，保留目标文件其它字段，不会把别处继承的值写死。
 - **核心字段**：`endpoint`、`teamId`、`agentId`、`userId`（后三者必填，空值会被拦下）。
 - **高级字段**：向导会问是否调整 `recall` / `capture` / `tls`；选“是”后逐项调整（布尔用选择器，数值用输入）。
