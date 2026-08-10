@@ -1,6 +1,6 @@
 {
   "name": "pi-tencentdb-agent-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TencentDB Agent Memory integration for pi: automatic L0 capture, L1/L2/L3 recall, and memory search tools.",
   "type": "module",
   "license": "MIT",
