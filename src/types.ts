@@ -1,5 +1,6 @@
 export interface RecallConfig {
   enabled: boolean;
+  timeoutMs: number;
   maxResults: number;
   includePersona: boolean;
   includeScenarios: boolean;

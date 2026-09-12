@@ -4,6 +4,10 @@
   "description": "TencentDB Agent Memory integration for pi: automatic L0 capture, L1/L2/L3 recall, and memory search tools.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LosLiSang/pi-tdai.git"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

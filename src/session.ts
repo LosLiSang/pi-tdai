@@ -1,5 +1,5 @@
 import type { CaptureBatch, CaptureMessage, CursorData } from "./types.js";
-import { sanitizeCapturedText, shouldCaptureText, stripCodeBlocks } from "./sanitize.js";
+import { MAX_CONVERSATION_MESSAGE_CHARS, sanitizeCapturedText, shouldCaptureText, stripCodeBlocks } from "./sanitize.js";
 
 export const CURSOR_ENTRY_TYPE = "tdai-memory-cursor";
 
@@ -83,6 +83,10 @@ export function collectCaptureBatch(
     let content = sanitizeCapturedText(extractTextContent(entry.message.content));
     if (role === "assistant" && stripAssistantCode) content = stripCodeBlocks(content);
     if (!shouldCaptureText(content)) continue;
+    if (content.length > MAX_CONVERSATION_MESSAGE_CHARS) {
+      content = content.slice(0, MAX_CONVERSATION_MESSAGE_CHARS).trim();
+      if (!content) continue;
+    }
 
     const rawTimestamp = entry.message.timestamp;
     const timestampMs = typeof rawTimestamp === "number" && Number.isFinite(rawTimestamp)

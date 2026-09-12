@@ -62,6 +62,7 @@ export function formatRecallContext(
   for (const [index, memory] of input.memories.entries()) {
     if (remaining <= 200) break;
     const meta = [
+      memory.id ? `id=${memory.id}` : undefined,
       memory.type,
       memory.score == null ? undefined : `score=${memory.score.toFixed(3)}`,
     ]

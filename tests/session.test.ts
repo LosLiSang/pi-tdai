@@ -68,6 +68,20 @@ describe("session capture", () => {
     expect(batch.hasSuccessfulAssistant).toBe(false);
   });
 
+  it("caps captured messages exceeding 8192 characters", () => {
+    const hugeContent = "x".repeat(10_000);
+    const batch = collectCaptureBatch([
+      { type: "message", id: "u1", message: { role: "user", content: hugeContent, timestamp: 1 } },
+      {
+        type: "message",
+        id: "a1",
+        message: { role: "assistant", content: "ok", stopReason: "stop", timestamp: 2 },
+      },
+    ], undefined, false);
+
+    expect(batch.messages[0].content.length).toBe(8192);
+  });
+
   it("builds a namespaced remote session id", () => {
     expect(buildSessionId("pi", "abc")).toBe("pi:abc");
     expect(buildSessionId("", "abc")).toBe("abc");

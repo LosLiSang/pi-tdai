@@ -14,6 +14,7 @@
   },
   "recall": {
     "enabled": true,
+    "timeoutMs": 2000,
     "maxResults": 5,
     "includePersona": true,
     "includeScenarios": true,

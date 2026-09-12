@@ -155,6 +155,70 @@ describe("pi extension integration", () => {
     expect(appended[0].customType).toBe("tdai-memory-cursor");
   });
 
+  it("bounds recall search query to at most 2048 chars when prompt is oversized", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = chunks.length > 0
+        ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>
+        : {};
+      requests.push({ path: request.url ?? "", body });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ code: 0, message: "ok", request_id: "req-1", data: { items: [] } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server address unavailable");
+
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-long-prompt-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "tencentdb-agent-memory.json"), JSON.stringify({
+      endpoint: `http://127.0.0.1:${address.port}`,
+      apiKey: "test-key",
+      serviceId: "default",
+      teamId: "team-1",
+      agentId: "agent-1",
+      userId: "user-1",
+    }));
+
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+    const fakePi = {
+      on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      registerTool() {},
+      registerCommand() {},
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+
+    tdaiMemoryExtension(fakePi);
+    const ctx = {
+      cwd,
+      mode: "print",
+      hasUI: false,
+      isProjectTrusted: () => true,
+      ui: { theme: { fg: (_c: string, t: string) => t }, setStatus: () => undefined, notify: () => undefined },
+      sessionManager: { getBranch: () => [], getSessionId: () => "sess-long" },
+    } as unknown as ExtensionContext;
+
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+
+    const longPrompt = "a".repeat(4000);
+    for (const handler of handlers.get("before_agent_start") ?? []) {
+      await handler({ prompt: longPrompt, systemPrompt: "base" }, ctx);
+    }
+
+    const searchReq = requests.find((r) => r.path === "/v3/atomic/search");
+    expect(searchReq).toBeDefined();
+    expect((searchReq!.body.query as string).length).toBeLessThanOrEqual(2048);
+  });
+
   it("stays disabled without any global or project config, even with env vars", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-no-config-"));
     cleanup.push(() => rm(cwd, { recursive: true, force: true }));
@@ -649,5 +713,214 @@ describe("tdai-memory-config command", () => {
     const search = tools.get("tdai_memory_search");
     expect(search).toBeTruthy();
     await expect(search!.execute("call-1", { query: "test" })).rejects.toThrow(/已禁用/);
+  });
+
+  it("tdai_memory_forget tool deletes L1 memories via deleteAtomic", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = chunks.length > 0
+        ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>
+        : {};
+      requests.push({ path: request.url ?? "", body });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ code: 0, message: "ok", request_id: "req-del", data: { deleted_count: 2 } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server address unavailable");
+
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-forget-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "tencentdb-agent-memory.json"), JSON.stringify({
+      endpoint: `http://127.0.0.1:${address.port}`,
+      apiKey: "test-key",
+      serviceId: "default",
+      teamId: "t1",
+      agentId: "a1",
+      userId: "u1",
+    }));
+
+    const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+    const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+    const fakePi = {
+      on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+        tools.set(def.name, def);
+      },
+      registerCommand() {},
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    const ctx = {
+      cwd,
+      mode: "print",
+      hasUI: false,
+      isProjectTrusted: () => true,
+      ui: { theme: { fg: (_c: string, t: string) => t }, setStatus: () => undefined, notify: () => undefined },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    for (const h of handlers.get("session_start") ?? []) await h({}, ctx);
+
+    const forgetTool = tools.get("tdai_memory_forget");
+    expect(forgetTool).toBeTruthy();
+
+    const result = await forgetTool!.execute("call-del", { ids: ["m1", "m2"] }) as {
+      content: Array<{ text: string }>;
+      details: { deletedCount: number; ids: string[] };
+    };
+
+    expect(result.content[0].text).toContain("已成功从 TencentDB Agent Memory 删除 2 条记忆");
+    expect(result.details.ids).toEqual(["m1", "m2"]);
+    const delReq = requests.find((r) => r.path === "/v3/atomic/delete");
+    expect(delReq).toBeDefined();
+    expect(delReq!.body).toMatchObject({ ids: ["m1", "m2"], team_id: "t1", agent_id: "a1", user_id: "u1" });
+  });
+
+  it("gates L1 recall for trivial prompts and reuses cached L2/L3", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = chunks.length > 0
+        ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>
+        : {};
+      requests.push({ path: request.url ?? "", body });
+      const data = request.url === "/v3/core/read"
+        ? { content: "persona content" }
+        : request.url === "/v3/scenario/ls"
+          ? { entries: [{ path: "p1.md", summary: "s1" }] }
+          : { items: [] };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ code: 0, message: "ok", request_id: "req-g", data }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server address unavailable");
+
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-gating-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "tencentdb-agent-memory.json"), JSON.stringify({
+      endpoint: `http://127.0.0.1:${address.port}`,
+      teamId: "t1",
+      agentId: "a1",
+      userId: "u1",
+    }));
+
+    const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+    const fakePi = {
+      on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      registerTool() {},
+      registerCommand() {},
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    const ctx = {
+      cwd,
+      mode: "print",
+      hasUI: false,
+      isProjectTrusted: () => true,
+      ui: { theme: { fg: (_c: string, t: string) => t }, setStatus: () => undefined, notify: () => undefined },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    for (const h of handlers.get("session_start") ?? []) await h({}, ctx);
+
+    // Turn 1: 实际问题，发起 L1、L2、L3 请求
+    for (const h of handlers.get("before_agent_start") ?? []) {
+      await h({ prompt: "如何配置数据库？", systemPrompt: "base" }, ctx);
+    }
+    expect(requests.filter((r) => r.path === "/v3/atomic/search")).toHaveLength(1);
+    expect(requests.filter((r) => r.path === "/v3/core/read")).toHaveLength(1);
+    expect(requests.filter((r) => r.path === "/v3/scenario/ls")).toHaveLength(1);
+
+    // Turn 2: 短确认指令（"好的"），L1 命中门禁不发请求；L2、L3 命中本地缓存不发请求
+    for (const h of handlers.get("before_agent_start") ?? []) {
+      await h({ prompt: "好的", systemPrompt: "base" }, ctx);
+    }
+    // 请求计数保持不变
+    expect(requests.filter((r) => r.path === "/v3/atomic/search")).toHaveLength(1);
+    expect(requests.filter((r) => r.path === "/v3/core/read")).toHaveLength(1);
+    expect(requests.filter((r) => r.path === "/v3/scenario/ls")).toHaveLength(1);
+  });
+
+  it("falls back gracefully when recall times out without blocking the agent", async () => {
+    const server = createServer(async (_req, res) => {
+      // 故意延迟 500ms 模拟卡顿
+      await new Promise((r) => setTimeout(r, 500));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: 0, message: "ok", data: {} }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server address unavailable");
+
+    const cwd = await mkdtemp(join(tmpdir(), "pi-tdai-timeout-"));
+    cleanup.push(() => rm(cwd, { recursive: true, force: true }));
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    // 设置激进的 50ms 超时
+    await writeFile(join(cwd, ".pi", "tencentdb-agent-memory.json"), JSON.stringify({
+      endpoint: `http://127.0.0.1:${address.port}`,
+      teamId: "t1",
+      agentId: "a1",
+      userId: "u1",
+      recall: { timeoutMs: 50 },
+    }));
+
+    const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+    const fakePi = {
+      on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      registerTool() {},
+      registerCommand() {},
+      appendEntry() {},
+    } as unknown as ExtensionAPI;
+    const { default: tdaiMemoryExtension } = await import("../src/index.js");
+    tdaiMemoryExtension(fakePi);
+
+    const ctx = {
+      cwd,
+      mode: "print",
+      hasUI: false,
+      isProjectTrusted: () => true,
+      ui: { theme: { fg: (_c: string, t: string) => t }, setStatus: () => undefined, notify: () => undefined },
+      sessionManager: { getBranch: () => [], getSessionId: () => "s1" },
+    } as unknown as ExtensionContext;
+
+    for (const h of handlers.get("session_start") ?? []) await h({}, ctx);
+
+    const start = Date.now();
+    let result: unknown;
+    for (const h of handlers.get("before_agent_start") ?? []) {
+      result = await h({ prompt: "测试超时", systemPrompt: "base prompt" }, ctx);
+    }
+    const duration = Date.now() - start;
+
+    // 确认快速失败放行，耗时远小于服务器 500ms 延迟
+    expect(duration).toBeLessThan(350);
+    // 超时降级未注入记忆，保留原始 prompt
+    expect(result).toBeUndefined();
   });
 });

@@ -21,6 +21,7 @@ const DEFAULT_CONFIG: MemoryConfig = {
   },
   recall: {
     enabled: true,
+    timeoutMs: 2_000,
     maxResults: 5,
     includePersona: true,
     includeScenarios: true,
@@ -88,6 +89,7 @@ function environmentConfig(env: NodeJS.ProcessEnv): JsonObject {
   });
   const recall = compactObject({
     enabled: parseBoolean(env.TDAI_MEMORY_RECALL_ENABLED),
+    timeoutMs: parseNumber(env.TDAI_MEMORY_RECALL_TIMEOUT_MS),
     maxResults: parseNumber(env.TDAI_MEMORY_RECALL_MAX_RESULTS),
     includePersona: parseBoolean(env.TDAI_MEMORY_INCLUDE_PERSONA),
     includeScenarios: parseBoolean(env.TDAI_MEMORY_INCLUDE_SCENARIOS),
@@ -151,6 +153,7 @@ function normalizeConfig(raw: JsonObject): MemoryConfig {
     },
     recall: {
       enabled: booleanValue(recall.enabled, DEFAULT_CONFIG.recall.enabled),
+      timeoutMs: boundedInteger(recall.timeoutMs, DEFAULT_CONFIG.recall.timeoutMs, 50, 30_000),
       maxResults: boundedInteger(recall.maxResults, DEFAULT_CONFIG.recall.maxResults, 1, 20),
       includePersona: booleanValue(recall.includePersona, DEFAULT_CONFIG.recall.includePersona),
       includeScenarios: booleanValue(recall.includeScenarios, DEFAULT_CONFIG.recall.includeScenarios),
@@ -257,6 +260,7 @@ export type ConfigScope = "project" | "global";
 
 const NUMERIC_KEYS = new Set([
   "timeoutMs",
+  "recall.timeoutMs",
   "recall.maxResults",
   "recall.maxScenarios",
   "recall.maxContextChars",
